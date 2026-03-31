@@ -33,6 +33,9 @@ const input = @import("input.zig");
 const gesture_mod = @import("gesture.zig");
 const GestureState = gesture_mod.GestureState;
 
+// Physics engine (Gate 2) -- friction deceleration and critically damped spring
+const physics = @import("physics.zig");
+
 // Depth stack layout engine (Gate 1)
 const stack_mod = @import("stack.zig");
 const Stack = stack_mod.Stack;
@@ -124,14 +127,17 @@ export fn init() void {
 /// Gate 2: drains the input ring buffer and feeds events through the
 /// gesture FSM, which produces scroll_position for the depth stack.
 export fn frame(dt: f32) void {
-    _ = dt;
-
     // Feed all pending input events into the gesture state machine.
     // The FSM converts raw touch/mouse events into scroll_position,
     // scroll_velocity, and snap targets.
     while (input.poll()) |event| {
         gesture.processEvent(event);
     }
+
+    // Physics update: friction deceleration (flinging) and critically damped
+    // spring (snapping). dt comes in as milliseconds from requestAnimationFrame,
+    // but physics expects seconds.
+    physics.update(&gesture, dt / 1000.0);
 
     // Pass the gesture scroll position to the depth stack for layout.
     // scroll_position is in card units (0=first card, 1=second, etc.)
@@ -184,6 +190,14 @@ export fn getCardCount() u32 {
     return visible_count;
 }
 
+/// Returns the current scroll position in card units (0 = first card,
+/// 1 = second, etc.). Exported so the JS host can make LOD decisions:
+/// cards near the scroll position get higher-resolution textures,
+/// while distant cards stay at lower tiers to save GPU memory.
+export fn getScrollPosition() f32 {
+    return gesture.scroll_position;
+}
+
 // ---------------------------------------------------------------------------
 // Tests -- run on native target via `zig build test`
 // ---------------------------------------------------------------------------
@@ -195,6 +209,7 @@ test {
     _ = @import("stack.zig");
     _ = @import("input.zig");
     _ = @import("gesture.zig");
+    _ = @import("physics.zig");
 }
 
 test "identity matrix is correct" {
@@ -281,4 +296,10 @@ test "tex index buffer is populated after init" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), ptr[0], 1e-5);
     // Last card should be texture 11
     try std.testing.expectApproxEqAbs(@as(f32, 11), ptr[MAX_CARDS - 1], 1e-5);
+}
+
+test "getScrollPosition returns gesture scroll_position" {
+    init();
+    // After init, scroll_position should be 0 (at first card)
+    try std.testing.expectApproxEqAbs(@as(f32, 0), getScrollPosition(), 1e-6);
 }
