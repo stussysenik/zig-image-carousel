@@ -190,6 +190,14 @@ export fn getCardCount() u32 {
     return visible_count;
 }
 
+/// Returns the number of visible cards after viewport culling.
+/// Alias for getCardCount -- exported so JS can verify that culling
+/// is working (e.g., when scrolled to card 5, fewer than MAX_CARDS
+/// instances are drawn).
+export fn getVisibleCount() u32 {
+    return visible_count;
+}
+
 /// Returns the current scroll position in card units (0 = first card,
 /// 1 = second, etc.). Exported so the JS host can make LOD decisions:
 /// cards near the scroll position get higher-resolution textures,

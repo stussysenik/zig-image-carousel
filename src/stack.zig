@@ -27,6 +27,12 @@ const Mat4 = m4.Mat4;
 /// Maximum number of cards in the stack.
 pub const MAX_CARDS: u32 = 12;
 
+/// Number of extra cards beyond the visible range to keep alive during
+/// layout. This viewport margin prevents popping artifacts when cards
+/// are about to scroll into view -- they already have valid transforms
+/// and opacities computed, so the transition is seamless.
+pub const VIEWPORT_MARGIN: f32 = 2.0;
+
 // ---------------------------------------------------------------------------
 // Layout parameters
 // ---------------------------------------------------------------------------
@@ -63,7 +69,8 @@ pub const CardState = struct {
     /// original position in the deck, NOT its visual position.
     texture_index: u32,
     /// Whether this card should be rendered. Cards scrolled off-screen
-    /// (effective index < -1 or >= MAX_CARDS) are hidden.
+    /// (effective index < -VIEWPORT_MARGIN or >= MAX_CARDS + VIEWPORT_MARGIN)
+    /// are culled. The margin provides a buffer for smooth scroll transitions.
     visible: bool,
 };
 
@@ -105,8 +112,9 @@ pub const Stack = struct {
     /// based on the current scroll_offset and layout parameters.
     ///
     /// Each card's "effective index" is its deck index minus scroll_offset.
-    /// Cards with effective index in [-1, MAX_CARDS) are visible; the
-    /// rest are culled.
+    /// Cards with effective index in [-VIEWPORT_MARGIN, MAX_CARDS + VIEWPORT_MARGIN)
+    /// are visible; the rest are culled. The margin keeps nearby off-screen
+    /// cards ready so scrolling transitions are seamless.
     pub fn computeLayout(self: *Stack) void {
         for (0..self.num_cards) |idx| {
             const i_f32: f32 = @floatFromInt(idx);
@@ -130,8 +138,12 @@ pub const Stack = struct {
             // --- Opacity (fade with distance) ---
             const alpha = @max(0.1, 1.0 - effective_i * opacity_decay);
 
-            // --- Visibility ---
-            const visible = effective_i >= -1.0 and effective_i < @as(f32, @floatFromInt(MAX_CARDS));
+            // --- Visibility (viewport culling with margin) ---
+            // Cards outside [-VIEWPORT_MARGIN, MAX_CARDS + VIEWPORT_MARGIN) are
+            // culled. The margin keeps nearby off-screen cards alive so they
+            // have valid transforms when scrolling brings them into view.
+            const upper_bound = @as(f32, @floatFromInt(MAX_CARDS)) + VIEWPORT_MARGIN;
+            const visible = effective_i >= -VIEWPORT_MARGIN and effective_i < upper_bound;
 
             // --- Model matrix: translate then scale ---
             const model = Mat4.translate(0, y, z).mul(Mat4.scaleUniform(s));
@@ -302,12 +314,62 @@ test "scroll offset shifts effective indices" {
     stack.scroll_offset = 2.0;
     stack.computeLayout();
 
-    // Card 0 is now at effective_i = -2, which is < -1 so not visible
-    try std.testing.expect(!stack.cards[0].visible);
-    // Card 1 is at effective_i = -1, visible
+    // Card 0 is at effective_i = -2, exactly at -VIEWPORT_MARGIN boundary,
+    // so still visible (the margin keeps nearby off-screen cards alive).
+    try std.testing.expect(stack.cards[0].visible);
+    // Card 1 is at effective_i = -1, within margin, visible
     try std.testing.expect(stack.cards[1].visible);
     // Card 2 is at effective_i = 0, visible and near origin
     try std.testing.expect(stack.cards[2].visible);
     const arr = stack.cards[2].transform.toArray();
     try std.testing.expectApproxEqAbs(@as(f32, 0), arr[14], 1e-5); // z ~ 0
+}
+
+test "viewport culling hides cards beyond margin" {
+    // With 12 cards and scroll_offset=5, effective indices are:
+    //   card 0: eff=-5 (culled, < -2)
+    //   card 1: eff=-4 (culled, < -2)
+    //   card 2: eff=-3 (culled, < -2)
+    //   card 3: eff=-2 (visible, at margin boundary)
+    //   card 4: eff=-1 (visible)
+    //   card 5: eff= 0 (visible, front)
+    //   ...
+    //   card 11: eff= 6 (visible, < 14)
+    // So cards 0..2 should be culled, cards 3..11 visible.
+    var stack = Stack.init(MAX_CARDS);
+    stack.scroll_offset = 5.0;
+    stack.computeLayout();
+
+    // Cards 0, 1, 2 are beyond the viewport margin -- culled
+    try std.testing.expect(!stack.cards[0].visible);
+    try std.testing.expect(!stack.cards[1].visible);
+    try std.testing.expect(!stack.cards[2].visible);
+
+    // Card 3 is at effective_i = -2 (exactly at boundary) -- visible
+    try std.testing.expect(stack.cards[3].visible);
+
+    // Cards 4..11 are all within range -- visible
+    for (4..MAX_CARDS) |idx| {
+        try std.testing.expect(stack.cards[idx].visible);
+    }
+
+    // writeTransforms should return 9 visible cards (indices 3..11)
+    var buf: [MAX_CARDS * 16]f32 = undefined;
+    const count = stack.writeTransforms(&buf);
+    try std.testing.expectEqual(@as(u32, 9), count);
+}
+
+test "visible count matches writeTransforms at various scroll positions" {
+    var stack = Stack.init(MAX_CARDS);
+
+    // At scroll=0, all 12 cards should be visible (eff 0..11, all in [-2, 14))
+    stack.scroll_offset = 0.0;
+    stack.computeLayout();
+    var buf: [MAX_CARDS * 16]f32 = undefined;
+    try std.testing.expectEqual(@as(u32, 12), stack.writeTransforms(&buf));
+
+    // At scroll=3, effective indices are -3..8. Card 0 (eff=-3) is culled.
+    stack.scroll_offset = 3.0;
+    stack.computeLayout();
+    try std.testing.expectEqual(@as(u32, 11), stack.writeTransforms(&buf));
 }
