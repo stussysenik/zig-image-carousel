@@ -145,8 +145,15 @@ pub const Stack = struct {
             const upper_bound = @as(f32, @floatFromInt(MAX_CARDS)) + VIEWPORT_MARGIN;
             const visible = effective_i >= -VIEWPORT_MARGIN and effective_i < upper_bound;
 
-            // --- Model matrix: translate then scale ---
-            const model = Mat4.translate(0, y, z).mul(Mat4.scaleUniform(s));
+            // --- Subtle X-axis tilt for receding cards ---
+            // Cards further back tilt slightly, creating a "fanning out"
+            // perspective effect that reinforces the depth stack illusion.
+            const tilt = effective_i * 0.015;
+
+            // --- Model matrix: translate, tilt, then scale ---
+            const model = Mat4.translate(0, y, z)
+                .mul(Mat4.rotateX(tilt))
+                .mul(Mat4.scaleUniform(s));
 
             self.cards[idx] = .{
                 .transform = model,

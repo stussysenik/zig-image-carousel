@@ -849,8 +849,15 @@ async function main() {
         evictLRU();
         scheduleOneLoad();
 
-        // Clear
-        gl.clearColor(0.04, 0.04, 0.06, 1.0);
+        // Dynamic background gradient: clear color subtly shifts with
+        // scroll position, creating a living, responsive atmosphere.
+        // The hue drifts from cool blue-black toward warmer tones as
+        // the user scrolls deeper into the stack.
+        const scrollNorm = Math.max(0, Math.min(1, scrollPos / 11));
+        const bgR = 0.04 + scrollNorm * 0.02;
+        const bgG = 0.04 + scrollNorm * 0.01;
+        const bgB = 0.06 + scrollNorm * 0.03;
+        gl.clearColor(bgR, bgG, bgB, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.enable(gl.DEPTH_TEST);
 
