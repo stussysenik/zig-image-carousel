@@ -1,14 +1,42 @@
 /**
- * host.js -- WebGL2 driver for the Zig Image Carousel
+ * host.js -- WebGL2 Instanced Rendering Driver for the Zig Image Carousel
  *
  * This is intentionally a *thin* GPU driver. All transform computation
  * happens in Zig; JS only:
  *   1. Loads the WASM module and wires up imports
- *   2. Creates the WebGL2 context and compiles shaders
- *   3. Each frame: reads matrices from WASM memory, sets uniforms, draws
+ *   2. Creates the WebGL2 context, compiles shaders, sets up instancing
+ *   3. Generates placeholder textures (numbered colored cards) as a 2D array
+ *   4. Each frame: reads matrices/opacities/texIndices from WASM memory,
+ *      uploads into instance buffers, issues a single drawArraysInstanced call
  *
  * Architecture: "Maximum Zig" -- JS never computes a matrix.
  */
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const MAX_CARDS = 12;
+const TEX_SIZE = 256; // Placeholder texture resolution (per layer)
+
+/**
+ * Placeholder card colors -- each card gets a distinct hue so the depth
+ * stack is immediately visually distinguishable without real images.
+ */
+const CARD_COLORS = [
+    [66, 133, 244],   // 1  Blue
+    [219, 68, 55],    // 2  Red
+    [244, 180, 0],    // 3  Yellow
+    [15, 157, 88],    // 4  Green
+    [255, 112, 67],   // 5  Orange
+    [171, 71, 188],   // 6  Purple
+    [0, 150, 136],    // 7  Teal
+    [255, 87, 34],    // 8  Deep Orange
+    [139, 195, 74],   // 9  Light Green
+    [3, 169, 244],    // 10 Light Blue
+    [255, 193, 7],    // 11 Amber
+    [103, 58, 183],   // 12 Deep Purple
+];
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -90,25 +118,104 @@ function linkProgram(vert, frag) {
 }
 
 // ---------------------------------------------------------------------------
-// Geometry: 3:2 aspect ratio card quad
+// Placeholder texture generation
 // ---------------------------------------------------------------------------
 
 /**
- * Creates a VAO with a 3:2 aspect card (vertices from -0.75,-0.5 to 0.75,0.5).
- * Two triangles forming a rectangle, centered at origin in the XY plane.
+ * Generate a 2D array texture with MAX_CARDS layers. Each layer is a
+ * TEX_SIZE x TEX_SIZE colored rectangle with a centered card number.
+ * Uses an offscreen canvas to render text, then uploads via texSubImage3D.
+ *
+ * @returns {WebGLTexture}
+ */
+function createPlaceholderTextures() {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, tex);
+
+    // Allocate storage for all layers at once
+    gl.texImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,                   // mip level
+        gl.RGBA8,            // internal format
+        TEX_SIZE, TEX_SIZE,  // width, height
+        MAX_CARDS,           // depth (number of layers)
+        0,                   // border
+        gl.RGBA,             // format
+        gl.UNSIGNED_BYTE,    // type
+        null                 // no data yet
+    );
+
+    // Create an offscreen canvas for rendering each card's placeholder
+    const offscreen = document.createElement("canvas");
+    offscreen.width = TEX_SIZE;
+    offscreen.height = TEX_SIZE;
+    const ctx = offscreen.getContext("2d");
+
+    for (let i = 0; i < MAX_CARDS; i++) {
+        const [r, g, b] = CARD_COLORS[i];
+
+        // Fill background with card color
+        ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+        ctx.fillRect(0, 0, TEX_SIZE, TEX_SIZE);
+
+        // Draw card number centered
+        ctx.fillStyle = "white";
+        ctx.font = "bold 96px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(`${i + 1}`, TEX_SIZE / 2, TEX_SIZE / 2);
+
+        // Upload this layer
+        gl.texSubImage3D(
+            gl.TEXTURE_2D_ARRAY,
+            0,                // mip level
+            0, 0, i,          // x, y, layer offset
+            TEX_SIZE, TEX_SIZE, 1, // width, height, depth
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            offscreen          // TexImageSource -- the canvas element
+        );
+    }
+
+    // Texture parameters
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+    return tex;
+}
+
+// ---------------------------------------------------------------------------
+// Geometry: card quad with positions + texcoords
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a VAO with a 3:2 aspect card quad. Each vertex has:
+ *   - vec2 a_position (location 0)
+ *   - vec2 a_texcoord  (location 1)
+ *
+ * The quad spans from (-0.75, -0.5) to (0.75, 0.5) in the XY plane,
+ * with texcoords from (0,0) to (1,1).
+ *
+ * Instance attributes (locations 2-7) are set up separately.
+ *
  * @returns {{ vao: WebGLVertexArrayObject, vertexCount: number }}
  */
 function createCardQuad() {
+    // Interleaved: [x, y, u, v] per vertex
     // prettier-ignore
     const vertices = new Float32Array([
-        // Triangle 1
-        -0.75, -0.5, 0.0,
-         0.75, -0.5, 0.0,
-         0.75,  0.5, 0.0,
+        // Triangle 1            // Texcoords
+        -0.75, -0.5,   0.0, 0.0,
+         0.75, -0.5,   1.0, 0.0,
+         0.75,  0.5,   1.0, 1.0,
         // Triangle 2
-        -0.75, -0.5, 0.0,
-         0.75,  0.5, 0.0,
-        -0.75,  0.5, 0.0,
+        -0.75, -0.5,   0.0, 0.0,
+         0.75,  0.5,   1.0, 1.0,
+        -0.75,  0.5,   0.0, 1.0,
     ]);
 
     const vao = gl.createVertexArray();
@@ -118,13 +225,59 @@ function createCardQuad() {
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
 
-    // a_position at location 0
+    const stride = 4 * 4; // 4 floats * 4 bytes each = 16 bytes
+
+    // a_position at location 0 (vec2)
     gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, stride, 0);
+
+    // a_texcoord at location 1 (vec2)
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, stride, 2 * 4);
+
+    // --- Instance attribute buffers ---
+
+    // Instance matrix buffer (locations 2-5): 4 vec4 columns per instance
+    // Total: 16 floats = 64 bytes per instance
+    const instanceMatrixBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceMatrixBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, MAX_CARDS * 16 * 4, gl.DYNAMIC_DRAW);
+
+    const matStride = 16 * 4; // 64 bytes per mat4
+    for (let col = 0; col < 4; col++) {
+        const loc = 2 + col;
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, matStride, col * 16);
+        gl.vertexAttribDivisor(loc, 1); // advance once per instance
+    }
+
+    // Instance opacity buffer (location 6): 1 float per instance
+    const instanceOpacityBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceOpacityBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, MAX_CARDS * 4, gl.DYNAMIC_DRAW);
+
+    gl.enableVertexAttribArray(6);
+    gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 4, 0);
+    gl.vertexAttribDivisor(6, 1);
+
+    // Instance tex layer buffer (location 7): 1 float per instance
+    const instanceTexLayerBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTexLayerBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, MAX_CARDS * 4, gl.DYNAMIC_DRAW);
+
+    gl.enableVertexAttribArray(7);
+    gl.vertexAttribPointer(7, 1, gl.FLOAT, false, 4, 0);
+    gl.vertexAttribDivisor(7, 1);
 
     gl.bindVertexArray(null);
 
-    return { vao, vertexCount: 6 };
+    return {
+        vao,
+        vertexCount: 6,
+        instanceMatrixBuf,
+        instanceOpacityBuf,
+        instanceTexLayerBuf,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -146,16 +299,22 @@ async function main() {
     ]);
     const program = linkProgram(vertShader, fragShader);
 
-    // 3. Get uniform locations
-    const uModel = gl.getUniformLocation(program, "u_model");
+    // 3. Get uniform locations (no more u_model -- it's per-instance now)
     const uView = gl.getUniformLocation(program, "u_view");
     const uProjection = gl.getUniformLocation(program, "u_projection");
-    const uColor = gl.getUniformLocation(program, "u_color");
+    const uTextures = gl.getUniformLocation(program, "u_textures");
 
-    // 4. Create card geometry
+    // 4. Create card geometry + instance buffers
     const card = createCardQuad();
 
-    // 5. Handle resize with devicePixelRatio
+    // 5. Generate placeholder texture array
+    const texArray = createPlaceholderTextures();
+
+    // 6. Get WASM buffer pointers (stable after init -- WASM memory might
+    //    grow but these are offsets into the data segment, not heap)
+    // We'll read pointers after init since init populates the buffers.
+
+    // 7. Handle resize with devicePixelRatio
     function handleResize() {
         const dpr = window.devicePixelRatio || 1;
         const displayW = Math.round(canvas.clientWidth * dpr);
@@ -171,10 +330,17 @@ async function main() {
     window.addEventListener("resize", handleResize);
     handleResize();
 
-    // 6. Init the Zig side
+    // 8. Init the Zig side (populates all buffers)
     wasm.exports.init();
 
-    // 7. Render loop
+    // Cache buffer pointers from WASM exports
+    const transformPtr = wasm.exports.getTransformBufferPtr();
+    const opacityPtr = wasm.exports.getOpacityBufferPtr();
+    const texIndexPtr = wasm.exports.getTexIndexBufferPtr();
+    const viewPtr = wasm.exports.getViewMatrixPtr();
+    const projPtr = wasm.exports.getProjMatrixPtr();
+
+    // 9. Render loop
     let lastTime = 0;
 
     function render(now) {
@@ -185,39 +351,48 @@ async function main() {
         // Let Zig update transforms
         wasm.exports.frame(dt);
 
+        // Read the card count (number of visible instances)
+        const cardCount = wasm.exports.getCardCount();
+
         // Clear
-        gl.clearColor(0.04, 0.04, 0.06, 1.0); // near-black, matches CSS
+        gl.clearColor(0.04, 0.04, 0.06, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.enable(gl.DEPTH_TEST);
 
+        // Enable alpha blending for opacity fading
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
         gl.useProgram(program);
 
-        // Read view and projection matrices from WASM memory
-        const viewPtr = wasm.exports.getViewMatrixPtr();
-        const projPtr = wasm.exports.getProjMatrixPtr();
+        // Upload view and projection matrices from WASM memory
         const viewMat = new Float32Array(wasmMemory.buffer, viewPtr, 16);
         const projMat = new Float32Array(wasmMemory.buffer, projPtr, 16);
-
         gl.uniformMatrix4fv(uView, false, viewMat);
         gl.uniformMatrix4fv(uProjection, false, projMat);
 
-        // Draw each card
-        const cardCount = wasm.exports.getCardCount();
-        const transformPtr = wasm.exports.getTransformBufferPtr();
+        // Bind the texture array to unit 0
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArray);
+        gl.uniform1i(uTextures, 0);
 
+        // Upload instance data from WASM memory into GPU buffers
+        const transforms = new Float32Array(wasmMemory.buffer, transformPtr, cardCount * 16);
+        const opacities = new Float32Array(wasmMemory.buffer, opacityPtr, cardCount);
+        const texIndices = new Float32Array(wasmMemory.buffer, texIndexPtr, cardCount);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, card.instanceMatrixBuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, transforms);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, card.instanceOpacityBuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, opacities);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, card.instanceTexLayerBuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, texIndices);
+
+        // Draw all visible card instances in one call
         gl.bindVertexArray(card.vao);
-
-        for (let i = 0; i < cardCount; i++) {
-            // Each Mat4 is 16 floats = 64 bytes
-            const modelMat = new Float32Array(wasmMemory.buffer, transformPtr + i * 64, 16);
-            gl.uniformMatrix4fv(uModel, false, modelMat);
-
-            // Gate 0: solid teal-ish color
-            gl.uniform4f(uColor, 0.26, 0.72, 0.82, 1.0);
-
-            gl.drawArrays(gl.TRIANGLES, 0, card.vertexCount);
-        }
-
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, card.vertexCount, cardCount);
         gl.bindVertexArray(null);
 
         requestAnimationFrame(render);
