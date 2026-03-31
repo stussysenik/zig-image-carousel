@@ -29,6 +29,10 @@ const Mat4 = m4.Mat4;
 // Input ring buffer (Gate 2) -- lock-free SPSC queue for touch/mouse events
 const input = @import("input.zig");
 
+// Gesture FSM (Gate 2) -- converts raw input into scroll position
+const gesture_mod = @import("gesture.zig");
+const GestureState = gesture_mod.GestureState;
+
 // Depth stack layout engine (Gate 1)
 const stack_mod = @import("stack.zig");
 const Stack = stack_mod.Stack;
@@ -78,6 +82,9 @@ var visible_count: u32 = 0;
 /// The depth stack instance -- manages layout for all cards.
 var depth_stack: Stack = Stack.init(MAX_CARDS);
 
+/// Gesture FSM instance -- processes input events and produces scroll_position.
+var gesture: GestureState = GestureState.init(MAX_CARDS);
+
 /// Current canvas dimensions.
 var canvas_width: u32 = 800;
 var canvas_height: u32 = 600;
@@ -114,19 +121,23 @@ export fn init() void {
 }
 
 /// Called every requestAnimationFrame. `dt` is the time delta in seconds.
-/// Gate 2: drains the input ring buffer each tick; gesture processing
-/// will be added in Task 5 (gesture FSM).
+/// Gate 2: drains the input ring buffer and feeds events through the
+/// gesture FSM, which produces scroll_position for the depth stack.
 export fn frame(dt: f32) void {
     _ = dt;
 
-    // Drain all pending input events from the JS-produced ring buffer.
-    // Events are consumed here to keep the ring from filling up; actual
-    // gesture interpretation (swipe, tap, fling) comes in Task 5.
-    while (input.poll()) |_| {
-        // Will be processed by gesture FSM in Task 5
+    // Feed all pending input events into the gesture state machine.
+    // The FSM converts raw touch/mouse events into scroll_position,
+    // scroll_velocity, and snap targets.
+    while (input.poll()) |event| {
+        gesture.processEvent(event);
     }
 
-    // Recompute layout each frame (will matter once scroll_offset animates)
+    // Pass the gesture scroll position to the depth stack for layout.
+    // scroll_position is in card units (0=first card, 1=second, etc.)
+    depth_stack.scroll_offset = gesture.scroll_position;
+
+    // Recompute layout each frame driven by gesture scroll_position.
     depth_stack.computeLayout();
     visible_count = depth_stack.writeTransforms(&transform_buffer);
     depth_stack.writeOpacities(&opacity_buffer);
@@ -183,6 +194,7 @@ test {
     _ = @import("mat4.zig");
     _ = @import("stack.zig");
     _ = @import("input.zig");
+    _ = @import("gesture.zig");
 }
 
 test "identity matrix is correct" {
