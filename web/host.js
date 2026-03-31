@@ -189,6 +189,117 @@ function createPlaceholderTextures() {
 }
 
 // ---------------------------------------------------------------------------
+// Input: touch/mouse event marshaling into WASM ring buffer
+// ---------------------------------------------------------------------------
+
+/**
+ * Wire up touch and mouse listeners that write InputEvent structs directly
+ * into the WASM-side ring buffer. This is the JS "producer" half of the
+ * lock-free SPSC queue; the Zig frame loop is the consumer.
+ *
+ * Event layout per slot (16 bytes, little-endian):
+ *   +0  u8    event_type  (1=start, 2=move, 3=end)
+ *   +1  [3]u8 padding
+ *   +4  f32   x  (CSS pixels)
+ *   +8  f32   y  (CSS pixels)
+ *   +12 f32   timestamp  (ms, performance.now())
+ *
+ * @param {WebAssembly.Exports} exports
+ * @param {WebAssembly.Memory} memory
+ */
+function initInput(exports, memory) {
+    const ringPtr = exports.getInputRingPtr();
+    const headPtr = exports.getInputHeadPtr();
+    const tailPtr = exports.getInputTailPtr();
+
+    const RING_SIZE = 64;
+    const EVENT_SIZE = 16; // bytes per InputEvent
+
+    /**
+     * Push one event into the ring buffer. If the ring is full the event
+     * is silently dropped -- this is acceptable because touch events arrive
+     * at ~60-120 Hz and the consumer drains every frame.
+     */
+    function writeEvent(type, x, y) {
+        const dv = new DataView(memory.buffer);
+        const head = dv.getUint32(headPtr, true);
+        const tail = dv.getUint32(tailPtr, true);
+
+        // Full check: (head - tail) >>> 0 treats the subtraction as unsigned
+        if (((head - tail) >>> 0) >= RING_SIZE) return; // ring full -- drop
+
+        const slot = (head & (RING_SIZE - 1)) * EVENT_SIZE + ringPtr;
+        dv.setUint8(slot, type);
+        // bytes 1-3 are padding (leave as-is / zero)
+        dv.setFloat32(slot + 4, x, true);
+        dv.setFloat32(slot + 8, y, true);
+        dv.setFloat32(slot + 12, performance.now(), true);
+
+        // Advance head (wrapping add via >>> 0 to stay u32)
+        dv.setUint32(headPtr, (head + 1) >>> 0, true);
+    }
+
+    // --- Touch events (mobile) ---
+    canvas.addEventListener(
+        "touchstart",
+        (e) => {
+            e.preventDefault();
+            const t = e.touches[0];
+            writeEvent(1, t.clientX, t.clientY);
+        },
+        { passive: false }
+    );
+
+    canvas.addEventListener(
+        "touchmove",
+        (e) => {
+            e.preventDefault();
+            const t = e.touches[0];
+            writeEvent(2, t.clientX, t.clientY);
+        },
+        { passive: false }
+    );
+
+    canvas.addEventListener(
+        "touchend",
+        (e) => {
+            e.preventDefault();
+            const t = e.changedTouches[0];
+            writeEvent(3, t.clientX, t.clientY);
+        },
+        { passive: false }
+    );
+
+    // --- Mouse events (desktop) ---
+    let mouseDown = false;
+
+    canvas.addEventListener("mousedown", (e) => {
+        mouseDown = true;
+        writeEvent(1, e.clientX, e.clientY);
+    });
+
+    canvas.addEventListener("mousemove", (e) => {
+        if (mouseDown) {
+            writeEvent(2, e.clientX, e.clientY);
+        }
+    });
+
+    canvas.addEventListener("mouseup", (e) => {
+        if (mouseDown) {
+            writeEvent(3, e.clientX, e.clientY);
+            mouseDown = false;
+        }
+    });
+
+    canvas.addEventListener("mouseleave", (e) => {
+        if (mouseDown) {
+            writeEvent(3, e.clientX, e.clientY);
+            mouseDown = false;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Geometry: card quad with positions + texcoords
 // ---------------------------------------------------------------------------
 
@@ -333,6 +444,9 @@ async function main() {
     // 8. Init the Zig side (populates all buffers)
     wasm.exports.init();
 
+    // 9. Wire up touch/mouse input into the WASM ring buffer
+    initInput(wasm.exports, wasmMemory);
+
     // Cache buffer pointers from WASM exports
     const transformPtr = wasm.exports.getTransformBufferPtr();
     const opacityPtr = wasm.exports.getOpacityBufferPtr();
@@ -340,7 +454,7 @@ async function main() {
     const viewPtr = wasm.exports.getViewMatrixPtr();
     const projPtr = wasm.exports.getProjMatrixPtr();
 
-    // 9. Render loop
+    // 10. Render loop
     let lastTime = 0;
 
     function render(now) {

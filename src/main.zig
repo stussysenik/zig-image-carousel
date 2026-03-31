@@ -26,6 +26,9 @@ const vec = @import("vec.zig");
 const m4 = @import("mat4.zig");
 const Mat4 = m4.Mat4;
 
+// Input ring buffer (Gate 2) -- lock-free SPSC queue for touch/mouse events
+const input = @import("input.zig");
+
 // Depth stack layout engine (Gate 1)
 const stack_mod = @import("stack.zig");
 const Stack = stack_mod.Stack;
@@ -111,9 +114,17 @@ export fn init() void {
 }
 
 /// Called every requestAnimationFrame. `dt` is the time delta in seconds.
-/// Gate 1: static depth stack (no animation yet -- scrolling comes in Gate 2).
+/// Gate 2: drains the input ring buffer each tick; gesture processing
+/// will be added in Task 5 (gesture FSM).
 export fn frame(dt: f32) void {
     _ = dt;
+
+    // Drain all pending input events from the JS-produced ring buffer.
+    // Events are consumed here to keep the ring from filling up; actual
+    // gesture interpretation (swipe, tap, fling) comes in Task 5.
+    while (input.poll()) |_| {
+        // Will be processed by gesture FSM in Task 5
+    }
 
     // Recompute layout each frame (will matter once scroll_offset animates)
     depth_stack.computeLayout();
@@ -171,6 +182,7 @@ test {
     _ = @import("vec.zig");
     _ = @import("mat4.zig");
     _ = @import("stack.zig");
+    _ = @import("input.zig");
 }
 
 test "identity matrix is correct" {
