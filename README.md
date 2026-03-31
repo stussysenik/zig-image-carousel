@@ -1,5 +1,8 @@
 # Zig 3D Depth Stack Carousel
 
+![Demo](demo.gif)
+
+
 A high-performance 3D image carousel written in **Zig**, compiled to **WebAssembly**, rendered via raw **WebGL2**. No frameworks. No abstractions. 16KB of WASM driving a full touch-interactive 3D experience.
 
 ![Depth Stack Front View](docs/screenshots/depth-stack-front.png)
